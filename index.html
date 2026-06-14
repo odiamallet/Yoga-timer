@@ -91,7 +91,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .toast.show{opacity:1}
 .rest-section{margin-top:6px;padding-top:6px;border-top:.5px solid #252535}
 .rest-label{font-size:11px;color:#534AB7;text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px}
-/* Modal */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
 .modal{background:#1a1a24;border:.5px solid #2a2a38;border-radius:14px;padding:22px 18px;width:100%;max-width:360px}
 .modal h3{font-size:16px;font-weight:500;color:#e8e4dc;margin-bottom:6px}
@@ -101,18 +100,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .modal-btns{display:flex;gap:8px}
 .modal-btns button{flex:1;padding:11px;border-radius:9px;cursor:pointer;font-size:14px;border:none;-webkit-tap-highlight-color:transparent}
 .modal-cancel{background:#252535;color:#7a7a9a}
-.modal-cancel:active{background:#2e2e40}
 .modal-confirm{background:#3a3050;color:#e8e4dc;border:.5px solid #534AB7 !important}
 .modal-confirm:active{background:#4a3f68}
+.wakelock-dot{width:6px;height:6px;border-radius:50%;background:#5a5a7a;margin-left:6px;display:inline-block;vertical-align:middle}
+.wakelock-dot.active{background:#6ab87a}
 </style>
 </head>
 <body>
 <div class="app">
   <div class="scroll">
-    <!-- TIMER PAGE -->
     <div class="page active" id="page-timer">
       <div style="text-align:center;padding:5px 0 0">
-        <div style="font-size:13px;color:#7a7a9a" id="session-label">No session selected</div>
+        <div style="font-size:13px;color:#7a7a9a;display:flex;align-items:center;justify-content:center;gap:4px">
+          <span id="session-label">No session selected</span>
+          <span class="wakelock-dot" id="wakelockDot" title="Screen wake lock"></span>
+        </div>
       </div>
       <div class="timer-circle">
         <svg class="ring" viewBox="0 0 200 200">
@@ -149,7 +151,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       </div>
     </div>
 
-    <!-- EDIT PAGE -->
     <div class="page" id="page-edit">
       <button class="new-btn" id="btnNew">+ New session</button>
       <div id="editorPanel">
@@ -181,9 +182,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             Add interval
           </button>
         </div>
-        <div class="btn-row" id="saveBtnRow">
-          <!-- Populated dynamically -->
-        </div>
+        <div class="btn-row" id="saveBtnRow"></div>
       </div>
     </div>
   </div>
@@ -200,7 +199,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   </div>
 </div>
 
-<!-- Save-as modal -->
 <div class="modal-overlay" id="saveAsModal" style="display:none">
   <div class="modal">
     <h3>Save as new session</h3>
@@ -228,19 +226,50 @@ const ICON512 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0e
 const BELL_OPTS = [['none','None'],['zen_gong','Zen gong'],['gong','Gong'],['tibet','Tibetan bowl'],['chime','Chime'],['chime_clear','Clear bell']];
 const CIRC = 2 * Math.PI * 94;
 
+// ── AUDIO ─────────────────────────────────────────────────
+// Use AudioContext so audio works reliably in background on Android
+let audioCtx = null;
+const audioBuffers = {};
+
+function getAudioCtx() {
+  if (!audioCtx || audioCtx.state === 'closed') {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+// Pre-decode all sounds into AudioBuffers at startup
+async function preloadSounds() {
+  const ctx = getAudioCtx();
+  await Promise.all(Object.entries(SOUNDS).map(async ([key, dataUrl]) => {
+    try {
+      const resp = await fetch(dataUrl);
+      const arr = await resp.arrayBuffer();
+      audioBuffers[key] = await ctx.decodeAudioData(arr);
+    } catch(e) { console.warn('Failed to preload', key, e); }
+  }));
+}
+
 let volume = parseFloat(localStorage.getItem('yogaVol') || '0.8');
-const audioCache = {};
 
 function playBell(type) {
-  if (!type || type === 'none' || !SOUNDS[type]) return;
-  if (!audioCache[type]) audioCache[type] = new Audio(SOUNDS[type]);
-  const a = audioCache[type];
-  a.volume = volume;
-  a.currentTime = 0;
-  a.play().catch(() => {});
+  if (!type || type === 'none') return;
+  const buf = audioBuffers[type];
+  if (!buf) return;
+  const ctx = getAudioCtx();
+  const src = ctx.createBufferSource();
+  const gain = ctx.createGain();
+  src.buffer = buf;
+  gain.gain.value = volume;
+  src.connect(gain);
+  gain.connect(ctx.destination);
+  src.start(0);
 }
+
 function testBell(selId) { playBell(document.getElementById(selId).value); }
 
+// Volume slider
 const volSlider = document.getElementById('volSlider');
 const volPct = document.getElementById('volPct');
 volSlider.value = Math.round(volume * 100);
@@ -251,11 +280,62 @@ volSlider.addEventListener('input', () => {
   localStorage.setItem('yogaVol', volume);
 });
 
+// ── WAKE LOCK ─────────────────────────────────────────────
+// Keeps screen on while timer is running
+let wakeLock = null;
+const wakelockDot = document.getElementById('wakelockDot');
+
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakelockDot.classList.add('active');
+    wakeLock.addEventListener('release', () => {
+      wakelockDot.classList.remove('active');
+      wakeLock = null;
+    });
+  } catch(e) { console.warn('Wake lock failed:', e); }
+}
+
+async function releaseWakeLock() {
+  if (wakeLock) {
+    try { await wakeLock.release(); } catch(e) {}
+    wakeLock = null;
+  }
+  wakelockDot.classList.remove('active');
+}
+
+// Re-acquire wake lock if page becomes visible again (e.g. after screen off)
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && timerState.running) {
+    await requestWakeLock();
+    // Resync timer after coming back from background
+    timerState.lastTs = null;
+  }
+});
+
+// ── BACKGROUND TIMER via Web Worker ──────────────────────
+// rAF pauses in background; a Worker-based clock keeps ticking accurately
+const workerCode = `
+  let interval = null;
+  self.onmessage = (e) => {
+    if (e.data === 'start') {
+      if (interval) clearInterval(interval);
+      interval = setInterval(() => self.postMessage('tick'), 200);
+    } else if (e.data === 'stop') {
+      if (interval) { clearInterval(interval); interval = null; }
+    }
+  };
+`;
+const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+const timerWorker = new Worker(URL.createObjectURL(workerBlob));
+
+// ── SESSION STATE ─────────────────────────────────────────
 let sessions = JSON.parse(localStorage.getItem('yogaSess6') || '[]');
 let selectedId = localStorage.getItem('yogaSel6') || null;
 let editingId = null;
 let editIntervals = [];
-let timerState = { running: false, stepIdx: 0, elapsed: 0, raf: null, lastTs: null };
+let timerState = { running: false, stepIdx: 0, elapsed: 0, lastWall: null };
 
 function saveSessions() { localStorage.setItem('yogaSess6', JSON.stringify(sessions)); }
 function getSession(id) { return sessions.find(s => s.id === id); }
@@ -322,7 +402,121 @@ function showToast(msg) {
   setTimeout(() => t.classList.remove('show'), 2200);
 }
 
-// ── SESSION LIST (timer page) ──────────────────────────────
+// ── WORKER TICK ───────────────────────────────────────────
+// Uses wall-clock time so background drift is corrected each tick
+timerWorker.onmessage = () => {
+  if (!timerState.running) return;
+  const now = Date.now();
+  if (timerState.lastWall === null) { timerState.lastWall = now; return; }
+  const delta = (now - timerState.lastWall) / 1000;
+  timerState.lastWall = now;
+  timerState.elapsed += delta;
+
+  const s = getSelected();
+  if (!s) return;
+  const steps = expandSteps(s);
+  const step = steps[timerState.stepIdx];
+  if (!step) { finishSession(); return; }
+
+  // Advance through any steps that were fully elapsed in background
+  while (timerState.elapsed >= steps[timerState.stepIdx]?.duration) {
+    const cur = steps[timerState.stepIdx];
+    timerState.elapsed -= cur.duration;
+    if (!cur.isLast) playBell(cur.bell);
+    timerState.stepIdx++;
+    if (timerState.stepIdx >= steps.length) { finishSession(); return; }
+  }
+
+  const curStep = steps[timerState.stepIdx];
+  const remaining = curStep.duration - timerState.elapsed;
+
+  // Only update DOM if page is visible
+  if (document.visibilityState === 'visible') {
+    document.getElementById('timerDisplay').textContent = fmtTime(remaining);
+    document.getElementById('currentIntervalName').textContent = curStep.name;
+    document.getElementById('timerSub').textContent = fmtDur(curStep.duration) + ' interval';
+    updateRing(timerState.elapsed / curStep.duration);
+    const nxt = steps[timerState.stepIdx + 1];
+    document.getElementById('nextIntervalInfo').textContent = nxt ? 'Next: ' + nxt.name + ' (' + fmtDur(nxt.duration) + ')' : 'Last interval';
+  }
+
+  // Send notification if in background
+  if (document.visibilityState === 'hidden' && Notification.permission === 'granted') {
+    // Handled by bell already
+  }
+};
+
+// ── TIMER CONTROLS ────────────────────────────────────────
+function setPlayIcon(playing) {
+  const svg = document.getElementById('playIconSvg');
+  svg.innerHTML = playing ? '<rect x="5" y="4" width="4" height="16"/><rect x="15" y="4" width="4" height="16"/>' : '<polygon points="5,3 19,12 5,21"/>';
+  svg.style.fill = '#e8e4dc'; svg.style.stroke = 'none';
+}
+
+function resetTimer(soft) {
+  timerWorker.postMessage('stop');
+  releaseWakeLock();
+  timerState = { running: false, stepIdx: 0, elapsed: 0, lastWall: null };
+  setPlayIcon(false);
+  if (!soft) updateTimerUI();
+}
+
+function finishSession() {
+  const s = getSelected();
+  if (s) playBell(s.endBell);
+  timerWorker.postMessage('stop');
+  releaseWakeLock();
+  timerState.running = false;
+  document.getElementById('timerDisplay').textContent = '00:00';
+  document.getElementById('timerSub').textContent = 'complete';
+  document.getElementById('currentIntervalName').textContent = 'Done!';
+  document.getElementById('nextIntervalInfo').textContent = '';
+  updateRing(1); setPlayIcon(false);
+  showToast('Session complete');
+  // Notify if in background
+  if (document.visibilityState === 'hidden' && Notification.permission === 'granted') {
+    new Notification('Yoga Timer', { body: 'Your session is complete!', icon: ICON192 });
+  }
+}
+
+document.getElementById('btnPlay').addEventListener('click', async () => {
+  const s = getSelected();
+  if (!s || !s.intervals.length) { showToast('Select a session first'); return; }
+  // Unlock AudioContext on user gesture
+  getAudioCtx();
+  if (!timerState.running) {
+    // Request notification permission for background alerts
+    if (Notification.permission === 'default') Notification.requestPermission();
+    await requestWakeLock();
+    if (timerState.stepIdx === 0 && timerState.elapsed === 0) {
+      setTimeout(() => playBell(s.startBell), 80);
+    }
+    timerState.running = true;
+    timerState.lastWall = null;
+    setPlayIcon(true);
+    timerWorker.postMessage('start');
+  } else {
+    timerState.running = false;
+    timerWorker.postMessage('stop');
+    releaseWakeLock();
+    setPlayIcon(false);
+  }
+});
+
+document.getElementById('btnReset').addEventListener('click', () => { resetTimer(false); updateTimerUI(); });
+
+document.getElementById('btnSkip').addEventListener('click', () => {
+  const s = getSelected();
+  if (!s) return;
+  const steps = expandSteps(s);
+  const step = steps[timerState.stepIdx];
+  if (step && !step.isLast) playBell(step.bell);
+  timerState.stepIdx++; timerState.elapsed = 0; timerState.lastWall = null;
+  if (timerState.stepIdx >= steps.length) { finishSession(); return; }
+  if (!timerState.running) updateTimerUI();
+});
+
+// ── SESSION LIST ──────────────────────────────────────────
 function renderTimerSessions() {
   const list = document.getElementById('timerSessionList');
   const empty = document.getElementById('timerEmptyState');
@@ -382,7 +576,6 @@ function selectSession(id) {
   localStorage.setItem('yogaSel6', id);
   renderTimerSessions();
 }
-
 function deleteSession(id, e) {
   e.stopPropagation();
   sessions = sessions.filter(s => s.id !== id);
@@ -390,7 +583,6 @@ function deleteSession(id, e) {
   saveSessions(); renderTimerSessions();
   showToast('Session deleted');
 }
-
 function duplicateSession(id, e) {
   e.stopPropagation();
   const src = getSession(id);
@@ -399,26 +591,19 @@ function duplicateSession(id, e) {
   copy.id = Date.now().toString();
   copy.name = src.name + ' (copy)';
   sessions.push(copy);
-  saveSessions();
-  renderTimerSessions();
+  saveSessions(); renderTimerSessions();
   showToast('Session duplicated');
 }
-
 function editSession(id, e) { e.stopPropagation(); editingId=id; showPage('edit'); }
 
 // ── EDITOR ────────────────────────────────────────────────
 function renderSaveBtns() {
   const row = document.getElementById('saveBtnRow');
   if (editingId) {
-    // Editing existing: Save changes + Save as new
-    row.innerHTML = `
-      <button class="save-btn secondary" id="btnSaveAs">Save as new</button>
-      <button class="save-btn" id="btnSave">Save changes</button>
-    `;
+    row.innerHTML = `<button class="save-btn secondary" id="btnSaveAs">Save as new</button><button class="save-btn" id="btnSave">Save changes</button>`;
     document.getElementById('btnSave').addEventListener('click', () => doSave(false));
     document.getElementById('btnSaveAs').addEventListener('click', openSaveAsModal);
   } else {
-    // New session: single save button
     row.innerHTML = `<button class="save-btn" id="btnSave">Save session</button>`;
     document.getElementById('btnSave').addEventListener('click', () => doSave(false));
   }
@@ -436,13 +621,14 @@ function renderEditor() {
 }
 
 function collectFormData() {
-  const name = document.getElementById('editName').value.trim() || 'My Session';
-  const startBell = document.getElementById('startBellSound').value;
-  const endBell = document.getElementById('endBellSound').value;
-  const intervals = editIntervals
-    .map(iv => ({ ...iv, duration: (iv.mins||0)*60+(iv.secs||0), repeat: Math.max(1,iv.repeat||1), restDuration: (iv.restMins||0)*60+(iv.restSecs||0) }))
-    .filter(iv => iv.duration > 0);
-  return { name, startBell, endBell, intervals };
+  return {
+    name: document.getElementById('editName').value.trim() || 'My Session',
+    startBell: document.getElementById('startBellSound').value,
+    endBell: document.getElementById('endBellSound').value,
+    intervals: editIntervals
+      .map(iv => ({ ...iv, duration: (iv.mins||0)*60+(iv.secs||0), repeat: Math.max(1,iv.repeat||1), restDuration: (iv.restMins||0)*60+(iv.restSecs||0) }))
+      .filter(iv => iv.duration > 0)
+  };
 }
 
 function doSave(asNew, overrideName) {
@@ -464,22 +650,18 @@ function doSave(asNew, overrideName) {
   return true;
 }
 
-// Save-as modal
 function openSaveAsModal() {
   const currentName = document.getElementById('editName').value.trim() || 'My Session';
   document.getElementById('saveAsName').value = currentName + ' (copy)';
   document.getElementById('saveAsModal').style.display = 'flex';
   setTimeout(() => document.getElementById('saveAsName').focus(), 100);
 }
-function closeSaveAsModal() {
-  document.getElementById('saveAsModal').style.display = 'none';
-}
+function closeSaveAsModal() { document.getElementById('saveAsModal').style.display = 'none'; }
 document.getElementById('saveAsCancel').addEventListener('click', closeSaveAsModal);
 document.getElementById('saveAsConfirm').addEventListener('click', () => {
   const name = document.getElementById('saveAsName').value.trim();
   if (!name) { document.getElementById('saveAsName').focus(); return; }
-  closeSaveAsModal();
-  doSave(true, name);
+  closeSaveAsModal(); doSave(true, name);
 });
 document.getElementById('saveAsModal').addEventListener('click', e => {
   if (e.target === document.getElementById('saveAsModal')) closeSaveAsModal();
@@ -538,8 +720,7 @@ function toggleRest(i, checked) {
   editIntervals[i].hasRest = checked;
   if (checked && !editIntervals[i].restName) {
     editIntervals[i].restName = 'Rest';
-    editIntervals[i].restMins = 1;
-    editIntervals[i].restSecs = 0;
+    editIntervals[i].restMins = 1; editIntervals[i].restSecs = 0;
     editIntervals[i].restBell = editIntervals[i].bell || 'chime';
   }
   renderIntervalRows();
@@ -551,95 +732,14 @@ document.getElementById('btnAddInterval').addEventListener('click', () => {
   editIntervals.push({ name:'Interval '+(editIntervals.length+1), mins:1, secs:0, bell:'chime', repeat:1, hasRest:false, restMins:1, restSecs:0, restName:'Rest', restBell:'chime' });
   renderIntervalRows();
 });
-
 document.getElementById('btnNew').addEventListener('click', () => { editingId=null; renderEditor(); });
 
-// ── TIMER ────────────────────────────────────────────────
-function setPlayIcon(playing) {
-  const svg = document.getElementById('playIconSvg');
-  svg.innerHTML = playing ? '<rect x="5" y="4" width="4" height="16"/><rect x="15" y="4" width="4" height="16"/>' : '<polygon points="5,3 19,12 5,21"/>';
-  svg.style.fill='#e8e4dc'; svg.style.stroke='none';
-}
-
-function resetTimer(soft) {
-  if (timerState.raf) cancelAnimationFrame(timerState.raf);
-  timerState = { running:false, stepIdx:0, elapsed:0, raf:null, lastTs:null };
-  setPlayIcon(false);
-  if (!soft) updateTimerUI();
-}
-
-function tick(ts) {
-  if (!timerState.running) return;
-  if (timerState.lastTs===null) timerState.lastTs=ts;
-  const delta = (ts - timerState.lastTs) / 1000;
-  timerState.lastTs=ts; timerState.elapsed+=delta;
-  const s = getSelected();
-  if (!s) return;
-  const steps = expandSteps(s);
-  const step = steps[timerState.stepIdx];
-  if (!step) { finishSession(); return; }
-  const remaining = step.duration - timerState.elapsed;
-  document.getElementById('timerDisplay').textContent = fmtTime(remaining);
-  document.getElementById('currentIntervalName').textContent = step.name;
-  document.getElementById('timerSub').textContent = fmtDur(step.duration)+' interval';
-  updateRing(timerState.elapsed / step.duration);
-  const nxt = steps[timerState.stepIdx+1];
-  document.getElementById('nextIntervalInfo').textContent = nxt ? 'Next: '+nxt.name+' ('+fmtDur(nxt.duration)+')' : 'Last interval';
-  if (timerState.elapsed >= step.duration) {
-    if (!step.isLast) playBell(step.bell);
-    timerState.stepIdx++; timerState.elapsed=0;
-    if (timerState.stepIdx >= steps.length) { finishSession(); return; }
-  }
-  timerState.raf = requestAnimationFrame(tick);
-}
-
-function finishSession() {
-  const s = getSelected();
-  if (s) playBell(s.endBell);
-  timerState.running=false;
-  document.getElementById('timerDisplay').textContent='00:00';
-  document.getElementById('timerSub').textContent='complete';
-  document.getElementById('currentIntervalName').textContent='Done!';
-  document.getElementById('nextIntervalInfo').textContent='';
-  updateRing(1); setPlayIcon(false);
-  showToast('Session complete');
-}
-
-document.getElementById('btnPlay').addEventListener('click', () => {
-  const s = getSelected();
-  if (!s || !s.intervals.length) { showToast('Select a session first'); return; }
-  if (!timerState.running) {
-    if (timerState.stepIdx===0 && timerState.elapsed===0) setTimeout(() => playBell(s.startBell), 80);
-    timerState.running=true; timerState.lastTs=null;
-    setPlayIcon(true);
-    timerState.raf = requestAnimationFrame(tick);
-  } else {
-    timerState.running=false;
-    if (timerState.raf) cancelAnimationFrame(timerState.raf);
-    setPlayIcon(false);
-  }
-});
-
-document.getElementById('btnReset').addEventListener('click', () => { resetTimer(false); updateTimerUI(); });
-
-document.getElementById('btnSkip').addEventListener('click', () => {
-  const s = getSelected();
-  if (!s) return;
-  const steps = expandSteps(s);
-  const step = steps[timerState.stepIdx];
-  if (step && !step.isLast) playBell(step.bell);
-  timerState.stepIdx++; timerState.elapsed=0;
-  if (timerState.stepIdx >= steps.length) { finishSession(); return; }
-  if (!timerState.running) updateTimerUI();
-});
-
-// ── PWA ──────────────────────────────────────────────────
+// ── PWA ───────────────────────────────────────────────────
 const manifest = {
   name:'Yoga Timer', short_name:'Yoga Timer',
   description:'Meditation and yoga interval timer',
   start_url:'.', display:'standalone',
-  background_color:'#0f0f14', theme_color:'#0f0f14',
-  orientation:'portrait',
+  background_color:'#0f0f14', theme_color:'#0f0f14', orientation:'portrait',
   icons:[
     { src:ICON192, sizes:'192x192', type:'image/png', purpose:'any maskable' },
     { src:ICON512, sizes:'512x512', type:'image/png', purpose:'any maskable' }
@@ -651,12 +751,15 @@ mLink.rel='manifest'; mLink.href=URL.createObjectURL(mBlob);
 document.head.appendChild(mLink);
 
 if ('serviceWorker' in navigator) {
-  const sw = `const C='yt-v1';self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(clients.claim()));self.addEventListener('fetch',e=>e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request).catch(()=>new Response('')))));`;
+  const sw = `const C='yt-v2';self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(clients.claim()));self.addEventListener('fetch',e=>e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request).catch(()=>new Response('')))));`;
   const swBlob = new Blob([sw], {type:'application/javascript'});
   navigator.serviceWorker.register(URL.createObjectURL(swBlob), {scope:'./'}).catch(()=>{});
 }
 
-renderTimerSessions();
+// Init
+preloadSounds().then(() => {
+  renderTimerSessions();
+});
 </script>
 </body>
 </html>
